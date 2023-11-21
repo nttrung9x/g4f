@@ -4,8 +4,7 @@ import time
 
 from ...typing import CreateResult, Messages
 from ..base_provider import BaseProvider
-from ..helper import format_prompt
-from ..webdriver import WebDriver, WebDriverSession
+from ..helper import WebDriver, format_prompt, get_browser
 
 models = {
     "theb-ai": "TheB.AI",
@@ -45,53 +44,26 @@ class Theb(BaseProvider):
         messages: Messages,
         stream: bool,
         proxy: str = None,
-        webdriver: WebDriver = None,
-        virtual_display: bool = True,
+        browser: WebDriver = None,
+        headless: bool = True,
         **kwargs
     ) -> CreateResult:
         if model in models:
             model = models[model]
         prompt = format_prompt(messages)
-        web_session = WebDriverSession(webdriver, virtual_display=virtual_display, proxy=proxy)
-        with web_session as driver:
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            from selenium.webdriver.common.keys import Keys
+        driver = browser if browser else get_browser(None, headless, proxy)
 
-            # Register fetch hook
-            script = """
-window._fetch = window.fetch;
-window.fetch = async (url, options) => {
-    // Call parent fetch method
-    const response = await window._fetch(url, options);
-    if (!url.startsWith("/api/conversation")) {
-        return result;
-    }
-    // Copy response
-    copy = response.clone();
-    window._reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-    return copy;
-}
-window._last_message = "";
-"""
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": script
-            })
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.common.keys import Keys
 
-            try:
-                driver.get(f"{cls.url}/home")
-                wait = WebDriverWait(driver, 5)
-                wait.until(EC.visibility_of_element_located((By.ID, "textareaAutosize")))
-            except:
-                driver = web_session.reopen()
-                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                    "source": script
-                })
-                driver.get(f"{cls.url}/home")
-                wait = WebDriverWait(driver, 240)
-                wait.until(EC.visibility_of_element_located((By.ID, "textareaAutosize")))
-
+        
+        try:
+            driver.get(f"{cls.url}/home")
+            wait = WebDriverWait(driver, 10 if headless else 240)
+            wait.until(EC.visibility_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(0.1)
             try:
                 driver.find_element(By.CSS_SELECTOR, ".driver-overlay").click()
                 driver.find_element(By.CSS_SELECTOR, ".driver-overlay").click()
@@ -115,6 +87,29 @@ window._last_message = "";
                 button = container.find_element(By.CSS_SELECTOR, "button.btn-blue.btn-small.border")
                 button.click()
 
+            # Register fetch hook
+            script = """
+window._fetch = window.fetch;
+window.fetch = (url, options) => {
+    // Call parent fetch method
+    const result = window._fetch(url, options);
+    if (!url.startsWith("/api/conversation")) {
+        return result;
+    }
+    // Load response reader
+    result.then((response) => {
+        if (!response.body.locked) {
+            window._reader = response.body.getReader();
+        }
+    });
+    // Return dummy response
+    return new Promise((resolve, reject) => {
+        resolve(new Response(new ReadableStream()))
+    });
+}
+window._last_message = "";
+"""
+            driver.execute_script(script)
 
             # Submit prompt
             wait.until(EC.visibility_of_element_located((By.ID, "textareaAutosize")))
@@ -128,8 +123,9 @@ if(window._reader) {
     if (chunk['done']) {
         return null;
     }
+    text = (new TextDecoder()).decode(chunk['value']);
     message = '';
-    chunk['value'].split('\\r\\n').forEach((line, index) => {
+    text.split('\\r\\n').forEach((line, index) => {
         if (line.startsWith('data: ')) {
             try {
                 line = JSON.parse(line.substring('data: '.length));
@@ -155,3 +151,8 @@ return '';
                     break
                 else:
                     time.sleep(0.1)
+        finally:
+            if not browser:
+                driver.close()
+                time.sleep(0.1)
+                driver.quit()
